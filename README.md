@@ -2,8 +2,8 @@
 
 ProcessControl is AI QA for pull requests. For each pull request it tests, an
 agent builds and opens the app at that commit on a machine of its own, tests
-each claim in the PR description, and checks every screen it looks at against
-the team's UI standards. The verdict lands on the commit as a GitHub check that
+the claims it finds in the PR description, and checks every screen it looks at
+against the team's UI standards. The verdict lands on the commit as a GitHub check that
 links to the run's evidence, such as screenshots and a screen recording. No
 test code is written or maintained. Linux is the self-serve platform: a claim
 only another platform can show is reported as blocked.
@@ -78,6 +78,11 @@ jobs:
         with:
           api-key: ${{ secrets.PROCESSCONTROL_API_KEY }}
 ```
+
+On `pull_request`, GitHub checks out the pull request merged into its base
+branch, while the run is for the pull request's head commit. Give
+`actions/checkout` that commit, `ref: ${{ github.event.pull_request.head.sha }}`,
+so the plan submitted is the one in it; otherwise the Action warns.
 
 Create the key under **Settings → API keys** at processcontrol.dev and store it
 as a secret. On the Free plan a run's repository must be connected through the

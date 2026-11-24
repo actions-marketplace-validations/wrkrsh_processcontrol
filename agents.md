@@ -3,7 +3,7 @@
 These steps are for a coding agent setting up ProcessControl in the repository
 it works in. The person you work with signs in once and approves; you do the
 rest. ProcessControl then tests pull requests, each on a machine of its own:
-an agent builds and launches the app, checks every claim in the PR
+an agent builds and launches the app, checks the claims it finds in the PR
 description, and reports a GitHub check that links to the run's evidence.
 
 ## Start a setup request
@@ -31,20 +31,25 @@ to your output:
 umask 077
 curl -sS https://processcontrol.dev/api/v1/setup/key \
   -H 'Content-Type: application/json' -d '{"deviceCode":"<deviceCode>"}' \
-  -o ~/.processcontrol-<userCode>.json -w '%{http_code} '
+  -o ~/.processcontrol-<userCode>.json -D ~/.processcontrol-<userCode>.headers \
+  -w '%{http_code}\n'
+grep -i '^retry-after' ~/.processcontrol-<userCode>.headers || true
 grep -o '"status":"[a-z]*"\|"error":"[^"]*"' ~/.processcontrol-<userCode>.json
 ```
 
-- `200 "status":"pending"`: keep waiting. The person may take a few minutes, so
-  if your commands have a time limit, poll in the background or across several
-  commands.
-- `200 "status":"complete"`: the person approved. The file holds the `apiKey`,
-  returned only once, and the `mention`. Each of your commands may run in a new
-  shell, so read the key from the file when you need it. Never commit, print
-  or paste it.
-- 403: the person denied the request. 410: it expired. Start again only if
-  they ask.
-- 429 or 503: wait for the `Retry-After` header, then poll again.
+The first line printed is the HTTP status:
+
+- 200 with `"status":"pending"`: keep waiting. The person may take a few
+  minutes, so if your commands have a time limit, poll in the background or
+  across several commands.
+- 200 with `"status":"complete"`: the person approved. The file holds the
+  `apiKey`, returned only once, and the `mention`. Each of your commands may
+  run in a new shell, so read the key from the file when you need it. Never
+  commit, print or paste it.
+- 403: the person denied the request. 410: it expired, or its key was already
+  returned. If that answer never reached you, the key is lost: tell the person
+  which key the `error` says to revoke. Start again only if they ask.
+- 429 or 503: wait the seconds its `retry-after` line gives, then poll again.
 
 ## Describe how to run the app
 
@@ -70,12 +75,13 @@ gh pr comment <number> --body "$(jq -r .mention ~/.processcontrol-<userCode>.jso
 
 When **Post results in** includes **PR thread**, the default, the app replies
 on the pull request with the results. To wait for the result, look at
-the **ProcessControl** check every minute or so; `gh pr checks --watch` would
-also wait for every other check on the pull request:
+the **ProcessControl · Pull request** check every minute or so;
+`gh pr checks --watch` would also wait for every other check on the pull
+request:
 
 ```sh
 gh pr checks <number> --json name,bucket,link \
-  --jq '.[] | select(.name | startswith("ProcessControl"))'
+  --jq '.[] | select(.name == "ProcessControl · Pull request")'
 ```
 
 A check titled **Waiting for setup** names what the run waits for: send the
@@ -100,12 +106,13 @@ that did not verify:
   fixtures the tester was missing to AGENTS.md or the README. A missing key or
   other secret goes in **Setup**, never in the repository: ask the person to
   add it there.
-- `blocked` with `blocker: "account"`: send the person the check's **Add a
-  test account** link, which opens the form in the run's workspace for this
-  repository, and tell them which app and login page the claim's evidence
-  names.
+- `blocked` with `blocker: "account"`: tell the person which app and login
+  page the claim's evidence names. When the run's `status` is `blocked`, send
+  them the check's **Add a test account** link, which opens the form in the
+  run's workspace for this repository; otherwise the check has no such link,
+  and the form is **App accounts** in ProcessControl's Settings.
 - `blocked` with `blocker: "platform"`: the claim needs another operating
   system or device; say so in the pull request.
 
-Then push: after the first mention, every push to the pull request, and every
-edit to its title or description, is tested again.
+Then push: once a mention has started a run, a push to the pull request or an
+edit to its title or description starts a test of its latest commit.
