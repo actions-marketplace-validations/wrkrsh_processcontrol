@@ -1,0 +1,149 @@
+name: ProcessControl Test Run
+# GitHub Marketplace's release page takes at most 125 characters here; README.md says the rest.
+description: Submit a test plan to ProcessControl, wait for the agent's verdict, and fail the job unless the run passes.
+branding:
+  icon: monitor
+  color: purple
+
+inputs:
+  api-url:
+    description: ProcessControl API base URL
+    required: false
+    default: https://processcontrol.dev
+  api-key:
+    description: API key from Settings → API keys at processcontrol.dev
+    required: true
+  plan-path:
+    description: Path to the test plan YAML in this repo
+    required: false
+    default: .processcontrol/testplan.yaml
+  timeout-minutes:
+    description: Max time to wait for the verdict and any required human UI review; after it the job fails and asks for the run to be cancelled
+    required: false
+    default: "135"
+
+outputs:
+  run-id:
+    description: The ProcessControl run id
+    value: ${{ steps.submit.outputs.run-id }}
+  run-url:
+    description: Dashboard URL for the run
+    value: ${{ steps.submit.outputs.run-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Submit run
+      id: submit
+      shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        API_KEY: ${{ inputs.api-key }}
+        PLAN_PATH: ${{ inputs.plan-path }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: |
+        set -euo pipefail
+        PC_TMP=$(mktemp -d)
+        trap 'rm -rf "$PC_TMP"' EXIT
+        BODY=$(jq -n \
+          --arg repo "$GITHUB_REPOSITORY" \
+          --arg sha "$HEAD_SHA" \
+          --rawfile plan "$PLAN_PATH" \
+          --arg pr "${PR_NUMBER:-}" \
+          '{repo: $repo, commitSha: $sha, planYaml: $plan}
+           + (if $pr == "" then {} else {prNumber: ($pr | tonumber)} end)')
+        # The API answers 429 + Retry-After when an organization submits too fast; wait it out.
+        for attempt in 1 2 3 4 5; do
+          HTTP=$(curl -sS -o "$PC_TMP/response.json" -w '%{http_code}' -D "$PC_TMP/headers.txt" -X POST "${API_URL%/}/api/v1/runs" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+          if [ "$HTTP" = 429 ]; then
+            WAIT=$(awk 'tolower($1)=="retry-after:"{print $2+0}' "$PC_TMP/headers.txt" | tr -d '\r')
+            echo "rate limited; retrying in ${WAIT:-5}s"
+            sleep "${WAIT:-5}"
+            continue
+          fi
+          [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ] && break
+          echo "::error title=ProcessControl::submit failed with HTTP $HTTP: $(cat "$PC_TMP/response.json")"
+          exit 1
+        done
+        if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+          echo "::error title=ProcessControl::submission retries exhausted (HTTP $HTTP)"
+          exit 1
+        fi
+        RESPONSE=$(cat "$PC_TMP/response.json")
+        RUN_ID=$(jq -er '.runId | select(type == "string" and length > 0)' <<<"$RESPONSE")
+        RUN_URL=$(jq -er '.url | select(type == "string" and length > 0)' <<<"$RESPONSE")
+        QUEUE=$(jq -r '.queue.detail // empty' <<<"$RESPONSE")
+        [ -n "$QUEUE" ] && echo "::warning title=ProcessControl::not claimed yet — $QUEUE"
+        {
+          echo "run-id=$RUN_ID"
+          echo "run-url=$RUN_URL"
+        } >> "$GITHUB_OUTPUT"
+        echo "::notice title=ProcessControl::run $RUN_ID queued — $RUN_URL"
+
+    - name: Wait for verdict
+      shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        API_KEY: ${{ inputs.api-key }}
+        RUN_ID: ${{ steps.submit.outputs.run-id }}
+        RUN_URL: ${{ steps.submit.outputs.run-url }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+      run: |
+        set -euo pipefail
+        PC_TMP=$(mktemp -d)
+        trap 'rm -rf "$PC_TMP"' EXIT
+        # A cancelled job's runner sends SIGINT, then kills the step 10 s later. Bash runs a trap only
+        # between commands, so waits go through `wait`, which the signal interrupts.
+        nap() { sleep "$1" & wait $! || true; }
+        # A run nobody waits for any more is cancelled, whether the wait timed out or the job did.
+        cancel() {
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+              "${API_URL%/}/api/v1/runs/$RUN_ID/cancel" -H "Authorization: Bearer $API_KEY" || true)
+            CODE=$(( 10#${CODE:-0} ))
+            [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ] && return 0
+            [ "$CODE" -eq 0 ] || [ "$CODE" -eq 429 ] || [ "$CODE" -ge 500 ] || break
+            sleep 1
+          done
+          echo "::warning title=ProcessControl::could not cancel run $RUN_ID (HTTP ${CODE:-none}) — $RUN_URL"
+          return 1
+        }
+        trap 'cancel || true; kill $(jobs -p) 2>/dev/null || true; exit 1' INT TERM
+        DEADLINE=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+        LAST=""
+        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+          # A poll that fails to connect reports HTTP 000 and is retried like any other failed poll.
+          HTTP=$(curl -sS --max-time 30 -o "$PC_TMP/response.json" -w '%{http_code}' -D "$PC_TMP/headers.txt" "${API_URL%/}/api/v1/runs/$RUN_ID" -H "Authorization: Bearer $API_KEY" || true)
+          if [ "$HTTP" = 429 ]; then
+            WAIT=$(awk 'tolower($1)=="retry-after:"{print $2+0}' "$PC_TMP/headers.txt" | tr -d '\r')
+            nap "${WAIT:-15}"
+            continue
+          fi
+          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+            echo "poll failed with HTTP $HTTP; retrying"
+            nap 15
+            continue
+          fi
+          RESPONSE=$(cat "$PC_TMP/response.json")
+          STATUS=$(jq -r .status <<<"$RESPONSE")
+          QUEUE=$(jq -r '.queue.detail // empty' <<<"$RESPONSE")
+          [ -n "$QUEUE" ] && STATUS="$STATUS ($QUEUE)"
+          [ "$STATUS" != "$LAST" ] && echo "status: $STATUS" && LAST=$STATUS
+          case "$STATUS" in
+            passed)
+              jq -r '.result.tests[] | "  ✓ \(.testId): \(.summary)"' <<<"$RESPONSE"
+              exit 0 ;;
+            failed|blocked|errored|cancelled)
+              jq -r '.result.tests[]? | "  \(if .status == "passed" then "✓" else "✗" end) \(.testId): \(.summary)", (.claims[]? | select(.verdict != "verified") | "    \(.verdict)\(if .blocker then " on \(.blocker)" else "" end): \(.claim) — \(.evidence)")' <<<"$RESPONSE"
+              echo "::error title=ProcessControl::run $STATUS — $RUN_URL"
+              exit 1 ;;
+          esac
+          nap 15
+        done
+        cancel && echo "::error title=ProcessControl::timed out waiting for run $RUN_ID, so cancelled it — $RUN_URL" \
+          || echo "::error title=ProcessControl::timed out waiting for run $RUN_ID — $RUN_URL"
+        exit 1
